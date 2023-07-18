@@ -15,6 +15,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+from alibi import AlibiApproach
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -32,6 +34,7 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config: 'GPTConfig'):
         super().__init__()
+        self.config = config
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -44,7 +47,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and not config.use_alibi
         if config.use_alibi:
             assert not self.flash, "Flash Attention is not compatible with Alibi as implemented at this time, see https://github.com/pytorch/pytorch/issues/96099"
         if not self.flash:
@@ -52,6 +55,7 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
+        self.alibi_approach = AlibiApproach(self.config.n_head)
 
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
@@ -71,6 +75,10 @@ class CausalSelfAttention(nn.Module):
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            if self.config.use_alibi:
+                # We add the ALIBI bias term after applying the scaling factor,
+                # see note 10 in the  ALiBi paper:
+                att = att + self.alibi_approach.get_bias_term(att)
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
